@@ -30,7 +30,7 @@
 12. [The validator store: every duty, walked through](#12-the-validator-store-every-duty-walked-through)
 13. [End-to-end: an attestation through one slot](#13-end-to-end-an-attestation-through-one-slot)
 14. [Forks: how behavior changes over time](#14-forks-how-behavior-changes-over-time)
-15. [ePBS / Gloas: the CStar fork (in progress)](#15-epbs--gloas-the-cstar-fork-in-progress)
+15. [ePBS / Gloas: Anchor's EIP-7732 support (in progress)](#15-epbs--gloas-anchors-eip-7732-support-in-progress)
 16. [A maintainer's debugging map](#16-a-maintainers-debugging-map)
 
 ---
@@ -751,59 +751,209 @@ for rate-limiting hooks).
 
 ## 8. Network topology: subnets and gossipsub topics
 
-SSV has its **own** libp2p gossip network, separate from the beacon network. To keep
-each node from drowning in every other cluster's traffic, the network is sharded into
-**128 subnets**, each a gossipsub topic. You subscribe only to the subnets your
-clusters map to.
+### The problem this section solves
 
-`anchor/subnet_service/src/subnet.rs:16`:
+SSV operators talk to each other over a peer-to-peer network. They use **libp2p
+gossipsub**, a protocol where a message you publish is forwarded peer-to-peer until
+everyone interested has seen it (like spreading a rumor through a crowd). This is a
+*separate* network from Ethereum's own beacon-chain gossip network — it carries only
+SSV consensus traffic (QBFT votes, partial signatures).
+
+The challenge: there are thousands of clusters on the network, all gossiping at once. If
+every operator had to listen to *all* of that traffic, each node would be flooded with
+messages it doesn't care about — most of it is consensus for validators that operator
+has nothing to do with. We need a way for an operator to hear **only** the traffic
+relevant to its own clusters.
+
+The solution is **topic-based filtering**. Gossipsub lets you split traffic into named
+channels called **topics**. You only receive messages on topics you've *subscribed* to.
+So if each cluster's traffic goes onto a predictable topic, an operator can subscribe to
+just the handful of topics its clusters use and ignore the rest.
+
+### Subnets: a fixed number of "buckets"
+
+If every cluster had its own topic, there could be tens of thousands of topics — too
+many to manage, and most would carry almost no traffic. Instead, SSV defines a fixed
+number of **subnets** — 128 of them — and deterministically assigns each cluster to one.
+A subnet is just a bucket; many clusters share the same subnet, and each subnet maps to
+exactly one gossipsub topic.
 
 ```rust
+// anchor/subnet_service/src/subnet.rs:16
 pub const SUBNET_COUNT: usize = 128;
 ```
 
-### Committee → subnet (fork-dependent)
+Because the assignment is deterministic (a pure function of the cluster's operator set),
+**every** operator computes the same subnet for a given cluster without coordinating.
+The sender knows which subnet to publish on, and the interested receivers know which
+subnets to listen on — they arrive at the same answer independently. The trade-off of
+having only 128 buckets is that you also receive traffic from *other* clusters that
+happen to land in the same bucket, but that's a small, bounded amount of noise compared
+to listening to everything.
 
-There are two algorithms, selected by the active fork (§14):
+### Committee → subnet: how a cluster is assigned to a bucket
 
-- **Alan** (`subnet.rs:54`, `from_committee_alan`): `committee_id % 128`.
-- **Boole** (`subnet.rs:71`, `from_operators`): hash each operator id, take the
-  **minimum** hash, then `% 128`. The MinHash trick makes an operator's *different*
-  committees more likely to land on the *same* subnet (whenever that operator owns the
-  min hash), so a busy operator monitors fewer subnets.
+Recall from §4 that a **committee** is identified by its operator set (the `CommitteeId`
+is the hash of the sorted operator IDs — it does **not** depend on the owner, so every
+cluster run by the same set of operators shares one committee and therefore one subnet).
+The subnet calculation turns that operator set into a number in `0..128`. There are two
+algorithms, and which one is used depends on the active network fork (§14):
 
-### The subnet service
+**Alan (the legacy algorithm)** — `from_committee_alan` at `subnet.rs:61`:
 
-`start_subnet_service` (`subnet_service/src/service.rs:148`) spawns a task that watches
-three things (`subscriptions.rs:86`):
+```rust
+// Interpret the 32-byte committee id as one big number, then take it modulo 128.
+let id = U256::from_be_bytes(*committee_id);
+SubnetId((id % U256::from(subnet_count)) ...)
+```
+
+Simply: `subnet = committee_id % 128`. Spreads committees roughly evenly across the 128
+buckets, but pays no attention to *which operator* is in which committee.
+
+**Boole (the newer algorithm)** — `from_operators` at `subnet.rs:89`. This uses a
+technique called **MinHash**:
+
+```rust
+// Hash each operator id on its own, then keep the single smallest hash.
+let min_hash = operator_ids
+    .iter()
+    .map(|operator_id| Sha256::digest(operator_id.to_le_bytes()))
+    .min()
+    .ok_or(SubnetCalculationError::EmptyOperatorList)?;
+// The subnet is that minimum hash, modulo 128.
+let subnet_id = U256::from_be_bytes(min_hash) % subnet_count;
+```
+
+Step by step: hash every operator ID in the committee separately, find the **smallest**
+of those hashes, and use it (mod 128) as the subnet.
+
+Why bother? The goal is to **reduce the number of distinct subnets a busy operator has
+to monitor.** Consider an operator that participates in many different committees (a
+common situation — see §4). Under Alan, each of those committees has a different
+`CommitteeId`, so each lands in a more-or-less random bucket; the operator ends up having
+to subscribe to many subnets. Under Boole's MinHash, whenever that operator happens to
+own the smallest hash in a committee, *all* such committees collapse onto the **same**
+subnet (because they share that same minimum). So a heavily-used operator tends to
+concentrate its committees into fewer subnets, which means fewer subscriptions and less
+peer-management overhead. The result is order-independent (sorting the operators doesn't
+change the minimum) and stable (the same operator set always yields the same subnet).
+
+### Subnet → topic string: naming the channel
+
+A subnet is just a number; the gossipsub topic is a **string**. The mapping is a
+prefix plus the subnet number (`topic.rs:16`, `create_topic`):
+
+- **Alan** topic: `ssv.v2.<subnet>`           e.g. `ssv.v2.42`
+- **Boole** topic: `/ssv/<network>/boole/<subnet>`  e.g. `/ssv/mainnet/boole/42`
+
+The fork determines the *prefix*, so the same subnet number is a different topic string
+before and after a fork — which is exactly what keeps pre-fork and post-fork traffic on
+separate channels during a transition.
+
+### The subnet service: keeping subscriptions in sync
+
+Knowing *how* to compute a subnet is only half the job. Something has to continuously
+answer the question **"given the clusters I'm currently part of, which topics should I be
+subscribed to right now?"** — and update those subscriptions whenever the answer changes.
+That is the **subnet service**.
+
+`start_subnet_service` (`service.rs:149`) spawns a long-lived background task. Its core
+is a loop that waits on three independent triggers (`subscriptions.rs:99`):
 
 ```rust
 tokio::select! {
+    // 1. Our cluster membership changed (a ValidatorAdded/Removed event hit the DB).
     _ = db.changed(), if !self.subscribe_all_subnets => {
-        // we joined/left a cluster → recompute required subnets
         self.handle_subnet_changes::<E>(&mut service_state).await;
     }
+    // 2. An epoch boundary passed — refresh gossipsub scoring rates.
     _ = sleep(delay), if !self.disable_gossipsub_topic_scoring => {
-        self.send_scoring_rate_updates::<E>(&service_state).await; // per-epoch
+        self.send_scoring_rate_updates::<E>(&service_state).await;
     }
-    Ok(()) = lifecycle_rx.changed() => {                            // fork transition
+    // 3. The network is transitioning between forks (e.g. Alan → Boole).
+    Ok(()) = lifecycle_rx.changed() => {
         self.on_lifecycle_transition(new_lifecycle, &mut service_state).await;
         self.handle_subnet_changes::<E>(&mut service_state).await;
     }
 }
 ```
 
-It emits `TopicEvent`s (`subnet.rs:140`) — `Subscribe { topic, subnet, message_rate }`,
-`Unsubscribe`, `RateUpdate` — to the network layer. The **topic string itself** is
-computed by the subnet service (the network layer stays fork-agnostic):
+**Trigger 1 — cluster membership changed.** When the on-chain event syncer (§6) records
+that we've joined or left a cluster, the in-memory `NetworkState` changes and the
+`db.changed()` branch fires. The service recomputes the full set of subnets it *should*
+be subscribed to — by taking every cluster it belongs to, extracting each one's operator
+set, and running the fork's subnet algorithm (`subscriptions.rs:175`,
+`handle_subnet_changes`). It then **diffs** that target set against what it's currently
+subscribed to:
 
-- Alan topic: `ssv.v2.<subnet>`
-- Boole topic: `/ssv/<network>/boole/<subnet>`
+```rust
+// subscriptions.rs:202 — only act on the difference, not the whole set.
+let to_leave = currently_subscribed.difference(&target_subnets);
+let to_join  = target_subnets.difference(&currently_subscribed);
+self.send_unsubscribes(...to_leave...).await?;
+self.send_subscribes(...to_join...).await?;
+```
 
-This is **SIP-43 slot-based routing**: the *message's slot* decides which fork's topic
-prefix applies, so a message for a pre-fork slot is published on the pre-fork topic
-even slightly after the fork. The end-to-end mapping
-`validator pubkey → cluster → committee → subnet → topic` is in §13.
+This diff is why the service only emits an event when something *actually* changed —
+joining one new cluster typically produces a single `Subscribe`, not 128 of them.
+
+**Trigger 2 — epoch boundary (scoring).** Gossipsub defends itself against misbehaving
+peers by *scoring* them: a peer that floods a topic, or one that goes suspiciously quiet,
+loses score and is eventually ignored. To judge "too much" or "too little," gossipsub
+needs to know the **expected** message rate for each topic. That rate depends on how many
+validators are active on the subnet, which changes as committees and sync-committee
+memberships rotate. So once per epoch the service recalculates each subscribed topic's
+expected rate (`scoring.rs:21`, `send_scoring_rate_updates`) and pushes it down as a
+`RateUpdate`. (Both this and the per-subscription rate can be turned off with
+`disable_gossipsub_topic_scoring`.)
+
+**Trigger 3 — fork transition.** When the network is approaching a fork, the topic
+*prefix* is about to change (`ssv.v2.*` → `/ssv/<net>/boole/*`), so for a window of time
+the node must listen on **both** the old and new topics to avoid missing messages. The
+service tracks a small state machine of fork "lifecycle" phases (`subscriptions.rs:123`,
+`on_lifecycle_transition`):
+
+- **WarmUp** (fork is coming): subscribe to the upcoming fork's topics *in addition to*
+  the current ones.
+- **GracePeriod** (fork just happened): keep the previous fork's topics subscribed a
+  while longer so late/in-flight messages still arrive.
+- **Normal** (settled): unsubscribe from the now-defunct fork's topics.
+
+This dual-subscription dance is what lets a node cross a fork boundary without dropping
+consensus messages that were published just before or after the switch.
+
+### What the service emits, and who acts on it
+
+The subnet service never touches libp2p directly. It only computes *decisions* and sends
+them as `TopicEvent`s (`subnet.rs:148`) over a channel to the network layer:
+
+- `Subscribe { topic, subnet, message_rate }`
+- `Unsubscribe { topic, subnet }`
+- `RateUpdate { topic, message_rate }`
+
+Note the events carry the **full topic string** — the network layer never has to know
+about forks or naming schemes; it just subscribes to whatever string it's handed. The
+network's `on_topic_event` (`network/src/network.rs:575`) is the consumer: on
+`Subscribe` it calls `gossipsub().subscribe(topic)`, applies the scoring parameters, and
+(on the *first* subscription to a subnet) tells the peer manager to go find peers on that
+subnet; on `Unsubscribe` it does the reverse, leaving the subnet only once the last
+subscription referencing it is gone. This split keeps the **policy** (which subnets, fork
+rules, scoring math) in the subnet service and the **mechanism** (libp2p calls, peer
+connections) in the network layer.
+
+### Slot-based routing (SIP-43)
+
+One subtlety ties this together. During a fork transition, which prefix should a given
+message use — old or new? The rule (SIP-43) is that the **message's own slot** decides,
+not the wall-clock moment of sending. A consensus message *for a pre-fork slot* is
+published on the pre-fork topic even if it goes out slightly after the fork has
+technically begun. The subnet service exposes slot-aware lookups for exactly this
+(`service.rs:95`, `subnet_for_committee_with_operators_at_slot`), and the message sender
+uses them so routing always matches the fork rules that were in effect for the slot the
+message belongs to.
+
+The complete end-to-end chain
+`validator pubkey → cluster → committee → subnet → topic` is walked through in §13.
 
 ---
 
@@ -1388,23 +1538,34 @@ variant, its `ForkConfig` in the built-in network configs, any new subnet/topic 
 and the `>= Fork::X` branches in the validator store. The `active_fork`/`active_fork_at_slot`
 calls are your search anchors.
 
-> A third fork, **CStar** (the SSV-side rollout of Ethereum's ePBS / Gloas upgrade), is
-> being built on the `epbs` branch and follows exactly this recipe. It is the worked
-> example of "adding a new fork," plus the duty-level changes ePBS forces. See §15.
+> Ethereum's **ePBS / Gloas** upgrade is being built on the `epbs` branch. Notably it does
+> *not* follow this "add an SSV fork" recipe: an early attempt to add a `Fork::CStar` ordinal
+> was reverted, and ePBS now gates directly on Ethereum's own `gloas_enabled()` boundary
+> instead. §15 covers that decision and the duty-level changes ePBS forces.
 
 ---
 
-## 15. ePBS / Gloas: the CStar fork (in progress)
+## 15. ePBS / Gloas: Anchor's EIP-7732 support (in progress)
 
 > **Branch note.** Everything in this section lives on the **`epbs`** branch, *not*
-> `unstable`. It is **work in progress**: some of it is merged, some is open PRs, and
-> several design points are deliberately unresolved because the SSV spec ([SIP-94][sip-94])
-> and the upstream Ethereum spec ([EIP-7732][eip-7732], the **Gloas** CL fork) are still
-> moving. Line numbers here reference `epbs` at the time of writing; as always, treat the
-> quoted **symbol names** as the durable references. Where something is not yet decided,
-> it is called out as an **open question** rather than stated as fact.
+> `unstable`. It is **work in progress**: some is merged, some is open issues, and several
+> design points are deliberately unresolved because the SSV-side spec (currently an *open*
+> pull request, [ssvlabs/SIPs #94][sip-94], `sips/epbs_support.md`) and the upstream
+> Ethereum spec ([EIP-7732][eip-7732], the **Gloas** CL fork) are both still moving. Line
+> numbers reference `epbs` at HEAD `a7c0b84`; treat the quoted **symbol names** as the
+> durable references. Where something is not yet decided it is flagged as an **open
+> question** rather than stated as fact.
 
-[sip-94]: https://github.com/ssvlabs/SIPs/blob/main/sips/epbs_support.md
+> **History note — `Fork::CStar` is gone.** An earlier draft of this section described an
+> SSV-invented `Fork::CStar` ordinal as the ePBS gate. **PR #1090 removed it entirely.**
+> ePBS is an *Ethereum* fork, not an SSV network fork, so Anchor now gates directly on
+> Ethereum's own boundary — `spec.fork_name_at_slot(slot).gloas_enabled()` (and the
+> equivalent `ForkName::Gloas` comparison), read from the eth2 `ChainSpec`'s
+> `gloas_fork_epoch`. The SSV `Fork` enum is back to just `Alan` and `Boole`
+> (`fork.rs:22`), and the `cstar` domain-type / schedule entries are deleted. If you find a
+> `>= Fork::CStar` reference anywhere, it is stale — the live check is `gloas_enabled()`.
+
+[sip-94]: https://github.com/ssvlabs/SIPs/pull/94
 [eip-7732]: https://eips.ethereum.org/EIPS/eip-7732
 
 ### 15.1 What ePBS changes, in one breath
@@ -1415,7 +1576,7 @@ it signs a *blinded* block (committing to a payload header) and trusts the relay
 its signature for the full payload. ePBS removes the relay. A block is split in two:
 
 - the **consensus block** (the beacon block, proposed at `t = 0`), which now commits to a
-  builder **bid** rather than to a full payload; and
+  builder **bid** — a `SignedExecutionPayloadBid` — rather than to a full payload; and
 - the **execution payload**, revealed *later in the slot* by the builder as a
   `SignedExecutionPayloadEnvelope` directly on the p2p network.
 
@@ -1423,57 +1584,53 @@ Three consequences ripple into validator duties, and therefore into Anchor:
 
 1. **The attestation deadline moves earlier** — from `1/3` of the slot (≈4000 ms) to `1/4`
    (3000 ms on a 12 s slot) — because attesters now vote only on the consensus block, not
-   on a validated payload.
-2. **`AttestationData.index` is repurposed** to carry the attester's view of payload status
-   (`0` = payload empty/absent, `1` = payload full/present), so it must now be agreed via
-   QBFT instead of being a locally-derived constant.
+   on a validated payload. (In spec terms this is the new basis-point timing model:
+   `ATTESTATION_DUE_BPS` drops from `3333` to `ATTESTATION_DUE_BPS_GLOAS = 2500`; the old
+   `INTERVALS_PER_SLOT` constant is retired.)
+2. **`AttestationData.index` is repurposed** to carry the attester's fork-choice view of
+   payload status (`0` = payload `EMPTY`, `1` = payload `FULL`), so it must now be agreed
+   via QBFT instead of being a locally-derived constant. (Spec carve-out: for a *same-slot*
+   attestation the index is always `0`.)
 3. **New duties appear**: the **Payload Timeliness Committee** (PTC) attestation, and the
-   proposer's **proposer-preferences** broadcast. The **blinded block** path disappears.
+   proposer's **proposer-preferences** broadcast. The **blinded block** path effectively
+   disappears (blinded blocks are no longer a concept under Gloas).
 
-On the SSV side this is gated behind a new fork, **CStar** — "the SSV-side rollout of
-Ethereum's Gloas (ePBS) features" (`fork.rs:37`).
+On the SSV side this is gated on Ethereum's Gloas activation (`gloas_enabled()`); there is
+no separate SSV fork for it.
 
-### 15.2 The fork wiring: `Fork::CStar`
+### 15.2 The fork wiring: gating on `ForkName::Gloas`
 
-The third `Fork` variant slots in after Boole (`anchor/common/fork/src/fork.rs:42`):
+Anchor does **not** invent an SSV fork for ePBS. The SSV `Fork` enum stays at two variants
+(`anchor/common/fork/src/fork.rs:22`):
 
 ```rust
 pub enum Fork {
     Alan,  // subnet = committee_id % 128;     topic "ssv.v2.<subnet>"
     Boole, // subnet = min(SHA256(op)) % 128;   topic "/ssv/<network>/boole/<subnet>"
-    CStar, // inherits Boole subnet topology;   topic "/ssv/<network>/cstar/<subnet>"
 }
 ```
 
-CStar reuses Boole's MinHash subnet topology — only the **topic prefix** changes
-(`/ssv/<network>/cstar/<subnet>`). The subnet code therefore just folds `CStar` into the
-Boole arm (`subnet_service/src/subnet.rs:121`, `service.rs:104`):
+Every ePBS behavior keys off Ethereum's fork instead, via the eth2 `ChainSpec` carried
+through Anchor. Two equivalent spellings appear in the code:
 
-```rust
-Fork::Boole | Fork::CStar => SubnetId::from_operators(operator_ids, crate::SUBNET_COUNT_NZ),
-```
+- **slot-scoped:** `self.spec.fork_name_at_slot::<E>(slot).gloas_enabled()` — used wherever
+  a slot is in hand (QBFT dispatch, committee signing).
+- **epoch/version-scoped:** `ForkName::from(version) >= ForkName::Gloas` — used where only a
+  decoded `version` or epoch is available (block decode, message validation).
 
-Like Boole, CStar carries its own **domain type** (`00000003` in the built-in
-`ssv_fork_schedule.yaml` examples) so its messages can't be replayed across the fork
-boundary, and `ForkSchedule::active_fork` gates behavior on it exactly as it does for Boole
-(§14). Everything in this section keys off the same `active_fork(epoch) >= Fork::CStar`
-check you already know.
-
-> **Open question — is `Fork::CStar` even the right gate?** Open PR **#1090** proposes
-> *removing* `Fork::CStar` entirely and gating on Ethereum's own boundary,
-> `spec.fork_name_at_slot(slot).gloas_enabled()`, sourced from the eth2 `ChainSpec`'s
-> `gloas_fork_epoch`. The argument: ePBS is an *Ethereum* fork, not an SSV-invented
-> network fork, so inventing an SSV fork ordinal for it is the wrong abstraction. If #1090
-> lands, the `>= Fork::CStar` checks throughout this section become `gloas_enabled()`
-> checks and the `cstar` schedule entries go away. The merged code below still uses
-> `Fork::CStar`; this is the single biggest "may change" caveat in the section.
+The payoff of this approach is that **no new SSV domain type, schedule entry, or subnet
+topology is needed** — ePBS messages ride the *existing* Boole subnet/topic surface, and
+the fork boundary is automatically the same one Ethereum and Lighthouse already agree on.
+The cost is that the gate is now spread across two crates' worth of `gloas_enabled()` /
+`ForkName::Gloas` call sites rather than one `Fork` ordinal; the **`gloas`** substring is
+your search anchor throughout this section.
 
 ### 15.3 Slot timing tightens (merged)
 
 Anchor previously hard-coded the attestation start at `slot/3` and aggregation at
 `slot*2/3`. Under Gloas the unaggregated-attestation deadline tightens to `slot/4`. Rather
 than branch on the fork by hand, Anchor now asks **Lighthouse's `ChainSpec`** for the
-deadline, which itself flips at `gloas_fork_epoch` (`validator_store/src/lib.rs:1496`):
+deadline, which itself flips at `gloas_fork_epoch` (`validator_store/src/lib.rs:1542`):
 
 ```rust
 let timeout_mode = TimeoutMode::SlotTime {
@@ -1482,9 +1639,9 @@ let timeout_mode = TimeoutMode::SlotTime {
 };
 ```
 
-`get_attestation_due` returns `unaggregated_attestation_due` pre-Gloas and
-`unaggregated_attestation_due_gloas` at/after it — a property pinned by a test
-(`lib.rs:3629`, `attestation_due_switches_at_gloas_boundary`). The metadata service's
+`get_attestation_due` returns the pre-Gloas deadline (≈`slot/3`) before the fork and the
+tighter Gloas deadline (`slot/4`) at/after it — a property pinned by a test
+(`lib.rs:3713`, `attestation_due_switches_at_gloas_boundary`). The metadata service's
 Phase 2 wake uses the **next** slot's deadline so the tighter budget applies on the correct
 side of the boundary (`metadata_service.rs:261`):
 
@@ -1496,17 +1653,19 @@ let fallback = self_clone_phase2.spec.get_attestation_due::<E>(next_slot);
 
 A broad, mechanical cleanup rides along: every `Duration::from_secs(spec.seconds_per_slot)`
 was replaced with `spec.get_slot_duration()` (client, notifier, subnet message-rate,
-validator store, metadata service). This is groundwork for **sub-second / basis-point slot
-timing**, where slot duration is no longer a whole number of seconds.
+validator store, metadata service). This is groundwork for **basis-point slot timing**: the
+Gloas spec drops the old `INTERVALS_PER_SLOT` model in favor of deadlines expressed in
+basis points of `SLOT_DURATION_MS` (e.g. `ATTESTATION_DUE_BPS_GLOAS = 2500` → 25 % = 3000
+ms on a 12 s slot), so slot duration is no longer assumed to be a whole number of seconds.
 
 > **Open research (#1028, #1092).** The tighter 3000 ms attestation deadline eats into the
 > consensus budget. With weighted-attestation-data (WAD) enabled, the WAD hard timeout now
 > races QBFT round 1 with near-zero slack; whether to lower it, fork-gate it, or document
-> the zero-slack behavior is **undecided pending production latency data**. Separately,
-> the committee QBFT instance still *hard-sleeps to the attestation deadline* before
-> starting round 1, so even with the head-event monitor delivering the vote early, consensus
-> doesn't start until ~3.0 s. Decoupling an `earliest_start` from the round-timeout anchor
-> is a proposed-but-unsettled design.
+> the zero-slack behavior is **undecided pending production latency data** (#1028).
+> Separately, the committee QBFT instance still *hard-sleeps to the attestation deadline*
+> before starting round 1, so even with the head-event monitor delivering the vote early,
+> consensus doesn't start until ~3.0 s; decoupling an `earliest_start` from the
+> round-timeout anchor is a proposed-but-unsettled design (#1092).
 
 ### 15.4 The attestation vote grows a field: `GloasBeaconVote` (merged)
 
@@ -1533,16 +1692,16 @@ pub struct GloasBeaconVote {
 `GloasBeaconVote` and `BeaconVote` are deliberately **separate types**: their SSZ
 encodings differ in length (120 vs 112 bytes), so a pre-Gloas binary mutually *rejects*
 Gloas-shaped wire bytes instead of silently misreading them — a fork-safety property pinned
-by `test_beacon_vote_rejects_gloas_bytes` (`consensus.rs`).
+by `test_beacon_vote_rejects_gloas_bytes` (`consensus.rs:2969`).
 
-The committee attestation path branches on the fork to pick the consensus value
-(`validator_store/src/lib.rs:1507`, in `sign_committee_attestations`):
+The committee attestation path branches on the Ethereum fork to pick the consensus value
+(`validator_store/src/lib.rs:1550`, in `sign_committee_attestations`):
 
 ```rust
 let (block_root, source, target, decided_hash) = if self
-    .fork_schedule
-    .active_fork(slot.epoch(E::slots_per_epoch()))
-    >= Fork::CStar
+    .spec
+    .fork_name_at_slot::<E>(slot)
+    .gloas_enabled()
 {
     // decide a GloasBeaconVote { ..., attestation_data_index: first_att_data.index }
     // TODO(#1027): apply `decided.attestation_data_index` to each validator's
@@ -1552,39 +1711,44 @@ let (block_root, source, target, decided_hash) = if self
 };
 ```
 
-> **Open gap (#1027).** Note the `TODO`: the Gloas branch reaches *consensus* on the index
-> but does not yet **apply** the decided index back onto each validator's `AttestationData`
-> before signing — the signing root is still built from `block_root/source/target` only.
-> Until #1027 lands, the index is agreed but not actually stamped onto the attestation.
+> **Open gap (#1027).** Note the `TODO(#1027)` at `lib.rs:1576`: the Gloas branch reaches
+> *consensus* on the index but does not yet **apply** the decided index back onto each
+> validator's `AttestationData` before signing — the signing root is still built from
+> `block_root/source/target` only. Until #1027 lands, the index is agreed but not actually
+> stamped onto the attestation.
 
 #### The Gloas validator: `GloasBeaconVoteValidator`
 
 A parallel validator (`consensus.rs:1193`) carries over every pre-Gloas check (far-future
-target, source < target, majority-fork protection, slashing) and adds the two SIP-94 rules:
+target, source < target, majority-fork protection, slashing) and adds the two Gloas rules:
 
 1. **Range-check** the index to `{0, 1}` (`consensus.rs:1267`) — anything `>= 2` is
-   `IndexOutOfRange`. The same-slot "`index = 0`" rule is *not* enforced here (it would
-   need a BN lookup) and is left to gossip/BN validation.
+   `IndexOutOfRange`. The same-slot "`index = 0`" rule (per the Ethereum spec) is *not*
+   enforced here — it would need a BN lookup — and is left to gossip/BN validation.
 2. **Slashing-DB reconstruction with the decided index** (`check_attestation_slashing`,
    `consensus.rs:1326`): the protection check rebuilds `AttestationData` using the single
    QBFT-decided `attestation_data_index`, so an operator can't be walked into signing both
    `index=0` and `index=1` for the same `(slot, source, target)` — a cross-index double
-   vote trips protection. (Pinned by `test_gloas_slashing_trips_on_cross_index_equivocation`.)
+   vote trips protection. (Pinned by `test_gloas_slashing_trips_on_cross_index_equivocation`,
+   `consensus.rs:2690`.)
 
-> **Accepted trust model (SIP-94 SC-2).** The index is **trusted from the QBFT leader** and
-> never compared against each operator's own BN view. A malicious leader can therefore push
-> a payload-status value contrary to the cluster's BN-majority observation; the documented
-> worst case is a *missed* attestation, not a slashing. The validator's job is to keep the
-> value *well-formed* and *non-self-slashing*, not to arbitrate fork choice.
+> **Accepted trust model.** The SSV spec (PR #94 §2) makes the index **trusted from the
+> QBFT leader** — it is never compared against each operator's own BN view, exactly as the
+> existing `BeaconVote.block_root` already trusts the leader. A malicious leader can
+> therefore push a payload-status value contrary to the cluster's BN-majority observation;
+> the validator's job is to keep the value *well-formed* and *non-self-slashing*, not to
+> arbitrate fork choice. (Caveat: the spec text frames this only as parallel to
+> `block_root` leader-trust; the "worst case is a missed attestation" characterization is
+> this document's own inference, not spec wording.)
 
 #### Routing in the QBFT manager
 
 `QbftManager` gains a fourth instance map, `gloas_beacon_vote_instances`
-(`qbft_manager/src/lib.rs:144`), and the `Role::Committee` ingress arm forks on the active
-fork to spawn the right instance type (`lib.rs:316`):
+(`qbft_manager/src/lib.rs:144`), and the `Role::Committee` ingress arm forks on the
+Ethereum fork to spawn the right instance type (`lib.rs:321`):
 
 ```rust
-if self.fork_schedule.active_fork(epoch) >= Fork::CStar {
+if self.spec.fork_name_at_slot::<E>(slot).gloas_enabled() {
     self.pass_to_instance::<GloasBeaconVote>(id, wrapped)
 } else {
     self.pass_to_instance::<BeaconVote>(id, wrapped)
@@ -1592,35 +1756,38 @@ if self.fork_schedule.active_fork(epoch) >= Fork::CStar {
 ```
 
 Both map to the **same** `Role::Committee` / `DutyExecutor::Committee` `MessageId`
-(`QbftDecidable for GloasBeaconVote`, `lib.rs:506`), so the message-ID/topic surface is
+(`QbftDecidable for GloasBeaconVote`, `lib.rs:511`), so the message-ID/topic surface is
 unchanged across the fork — only the *decoded value type* differs. The
 `gloas_dispatch_tests` (`qbft_manager/src/tests/gloas_dispatch_tests.rs`) assert that a
-committee message spawns a `GloasBeaconVote` instance at/after CStar and a `BeaconVote`
+committee message spawns a `GloasBeaconVote` instance at/after Gloas and a `BeaconVote`
 instance before it.
 
 > **Open gap (#1061) — the sync-committee path was *not* migrated.**
-> `sign_committee_sync_committee_signatures` (`validator_store/src/lib.rs:1364`) still
-> decides over a plain `BeaconVote` at `slot/3` timing, while the *ingress* router (above)
-> sends post-CStar committee messages to `GloasBeaconVote` instances. The result: at CStar,
-> the sync-message committee instance receives no matching peer input and **times out every
-> slot**. #1061 tracks aligning both call sites on `GloasBeaconVote`. This is a concrete,
-> known regression on the branch — not a hypothetical.
+> `sign_committee_sync_committee_signatures` (`validator_store/src/lib.rs:1410`) still
+> decides over a plain `BeaconVote` at `slot/3` timing (`get_slot_duration() / 3`,
+> `lib.rs:1431`), while the *ingress* router (above) sends post-Gloas committee messages to
+> `GloasBeaconVote` instances. The result: after Gloas, the sync-message committee instance
+> receives no matching peer input and **times out every slot**. #1061 tracks aligning both
+> call sites on `GloasBeaconVote`. This is a concrete, known regression on the branch — not
+> a hypothetical.
 
 ### 15.5 The block loses its blinded form (merged)
 
 Under Gloas the execution payload is decoupled from the block body, so the proposer signs a
-plain `BeaconBlock` and the **blinded-block concept becomes redundant** — full and blinded
-SSZ projections are byte-identical. `ProposerConsensusData` gains a direct
-`decode_block::<E>()` (`consensus.rs:267`), and the two consumers fork-gate accordingly:
+plain `BeaconBlock` and the **blinded-block concept becomes redundant** — blinded blocks are
+no longer a Gloas concept at all, so for this variant the would-be blinded and full
+projections decode to the same thing. `ProposerConsensusData` gains a direct
+`decode_block::<E>()` (`consensus.rs:267`), and the two consumers fork-gate on
+`ForkName::Gloas` accordingly:
 
-- **Block signing** — `decode_decided_block` (`validator_store/src/lib.rs:1888`): Gloas
-  decodes `DataSSZ` directly as a `BeaconBlock`; pre-Gloas keeps the existing
+- **Block signing** — `decode_decided_block` (`validator_store/src/lib.rs:1934`, branch at
+  `:1939`): Gloas decodes `DataSSZ` directly as a `BeaconBlock`; pre-Gloas keeps the existing
   try-blinded-then-full fallback. This removes a guaranteed-to-fail blinded decode on every
   Gloas proposal.
 - **Block validation** — `ProposerConsensusDataValidator::validate_block_proposal`
-  (`consensus.rs`): same fork branch, and `decode_blinded_block` now *rejects* Gloas input
-  with `NoMatchingVariant` (`consensus.rs:252`) so the blinded path can never be taken
-  post-fork.
+  (`consensus.rs:387`, branch at `:399`): same fork gate, and `decode_blinded_block` now
+  *rejects* Gloas input with `NoMatchingVariant` (`consensus.rs:255`) so the blinded path can
+  never be taken post-fork (pinned by `decode_blinded_block_rejects_gloas`, `consensus.rs:3038`).
 
 > **Open gap (#1017), blocked upstream.** `sign_block`'s destructure of Lighthouse's
 > `FullBlockContents` will need a Gloas arm that extracts the `.block` and explicitly drops
@@ -1629,25 +1796,31 @@ SSZ projections are byte-identical. `ProposerConsensusData` gains a direct
 > `produceBlockV4` self-build body shape — LH itself carries a TODO that its current Gloas
 > SSZ encoding diverges from the in-flight spec.
 
-> **Out of scope, by spec.** Distributed signing of the builder's
-> `SignedExecutionPayloadEnvelope` is **not** an SSV duty (SIP-94 commit `cfb672e`). On a
-> self-build slot the cluster does not republish the envelope, with the accepted consequence
-> that PTC members may observe `payload_present = FALSE`. Accordingly,
-> `sign_execution_payload_envelope` is a deliberate `Unsupported` stub
-> (`lib.rs:3269`, `TODO(cstar)`).
+> **Envelope signing — stubbed in code, but the spec is in flux.** In the *code*,
+> distributed signing of the builder's `SignedExecutionPayloadEnvelope` is a deliberate
+> `Unsupported` stub (`sign_execution_payload_envelope`, `lib.rs:3315`, `TODO(gloas)`).
+> An earlier SSV-spec draft (the basis for that stub) treated envelope signing as **out of
+> scope** — not an SSV duty, with the accepted consequence that on a self-build slot the
+> cluster does not republish the envelope and PTC members may observe
+> `payload_present = FALSE`. **However, the current SIP PR #94 has since reversed this**: at
+> its present HEAD it defines envelope signing as a *new QBFT-based SSV duty* (a second QBFT
+> round producing the signature, which operators then publish). This is exactly the kind of
+> moving target this section warns about — the code's stub reflects the *older* design, and
+> aligning it with the current spec is open, unscheduled work.
 
 ### 15.6 The PTC attestation: a new validator-scoped, *leaderless* duty
 
-The Payload Timeliness Committee is a 512-validator subset of a slot's attesters. Each
-member independently observes whether the builder revealed the payload on time and
-broadcasts a `PayloadAttestationMessage` (`payload_present: bool`). Crucially this is **not
-a consensus duty**: there is no value to negotiate (each member reports its own observation)
-and there is no slashing for PTC equivocation. This shape drove a mid-effort **redesign** on
-the branch.
+The Payload Timeliness Committee is a 512-validator subset of a slot's attesters
+(`PTC_SIZE = 512` in the spec). Each member independently observes whether the builder
+revealed the payload on time and broadcasts a `PayloadAttestationMessage` (whose
+`PayloadAttestationData` carries `payload_present` and `blob_data_available`). Crucially this
+is **not a consensus duty**: there is no value to negotiate (each member reports its own
+observation) and there is no slashing for PTC equivocation. This shape drove a mid-effort
+**redesign** on the branch.
 
-The wire surface is `Role::PTCAttester` (`common/ssv_types/src/msgid.rs:24`) with a matching
-`PartialSignatureKind::PTCAttester = 7` (`partial_sig.rs`). Its defining property is that it
-is **validator-scoped and non-QBFT**:
+The wire surface is `Role::PTCAttester` (`common/ssv_types/src/msgid.rs:24`, wire byte
+`[7,0,0,0]` at `:37`) with a matching `PartialSignatureKind::PTCAttester`. Its defining
+property is that it is **validator-scoped and non-QBFT**:
 
 - It uses `DutyExecutor::Validator` (keyed by validator pubkey), not `Committee`
   (`msgid.rs:164`).
@@ -1669,19 +1842,22 @@ pinned by a test (`role_qbft_classification_is_pinned`, `msgid.rs`):
    (This replaced the hand-maintained `ValidatorRegistration | VoluntaryExit` list and
    retired the now-dead `FailedToGetMaxRound` failure.)
 2. **QBFT manager routing** — `PTCAttester` is added to the "these roles don't use QBFT"
-   arms in `receive_data` (`qbft_manager/src/lib.rs:282`, `:350`), so a PTC message can never
+   arms in `receive_data` (`qbft_manager/src/lib.rs:286`, `:355`), so a PTC message can never
    spawn a consensus instance.
 3. **Partial-signature validation** — `PTCAttester` binds to its own
    `PartialSignatureKind::PTCAttester` (`partial_signature.rs:148`), counts as a
-   pre-consensus message (`message_counts.rs`), allows **one** signature per packet
-   (`partial_signature.rs`), gets a flat per-validator duty limit of `2` (`lib.rs:1018`),
-   and uses the **short TTL** (`1 + LATE_SLOT_ALLOWANCE`, `lib.rs:932`) because a PTC vote is
-   only useful for its own slot.
+   pre-consensus message (`message_counts.rs:70`, `:114`), gets a flat per-validator duty
+   limit of `2` (`lib.rs:1034`), and uses the **short TTL** (`1 + LATE_SLOT_ALLOWANCE`,
+   `lib.rs:948`) because a PTC vote is only useful for its own slot.
 
-A fork safety-net rejects `PTCAttester` messages before CStar with `RoleNotActiveBeforeFork`
-(`message_validator/src/lib.rs:863`).
+A fork safety-net rejects `PTCAttester` messages before Gloas. Note this is a **distinct
+failure variant** from the SSV-fork gate: PTC uses `RoleNotActiveBeforeEthFork`
+(`message_validator/src/lib.rs:879`), keyed on the *Ethereum* fork
+(`spec.fork_name_at_epoch(epoch).gloas_enabled()`, `minimum_fork: ForkName::Gloas`), whereas
+the older Boole-gated roles use `RoleNotActiveBeforeFork` keyed on the SSV `Fork` ordinal
+(`lib.rs:859`). The two variants sit side by side in `validate_role_for_fork` (`lib.rs:849`).
 
-> **This area was redesigned mid-flight — read git history carefully.** SIP-94 §3 was
+> **This area was redesigned mid-flight — read git history carefully.** The SSV spec was
 > rewritten from a *committee-scoped, QBFT-based* PTC to the *validator-scoped, leaderless*
 > model above. Two merged-then-reworked PRs are the fossils: a committee-scoped
 > `Role::PTCCommittee` (#1033) was retargeted to `Role::PTCAttester` (#1080), and a
@@ -1689,52 +1865,95 @@ A fork safety-net rejects `PTCAttester` messages before CStar with `RoleNotActiv
 > dead code. If you find references to "PTC QBFT" or a payload-attestation consensus value,
 > they are obsolete.
 
-> **Open work (#1077/#1078, #1079).** The signing path `sign_payload_attestation`
-> (`validator_store/src/lib.rs:3278`) and the proposer-preferences path
-> `sign_proposer_preferences` (`lib.rs:3287`) are `Unsupported` / `TODO(cstar)` stubs on
-> this snapshot; the client-side `PayloadAttestationService` / `ProposerPreferencesService`
-> wiring (HTTP timeout quotients are already reserved at `client/src/lib.rs:80`) is open.
-> Because PTC is honest-convergence rather than consensus, a minority operator near the
-> observation cutoff can silently miss the threshold; surfacing that as a distinguishable
-> divergence metric (#1079) is itself **not a normative SIP-94 requirement** and is open
-> research.
+> **Signing path now implemented (#1082); client wiring still open.** `sign_payload_attestation`
+> (`validator_store/src/lib.rs:3324`) is **no longer a stub** — it collects a single-validator
+> partial signature over the `PayloadAttestationData` signing root (`Domain::PTCAttester`),
+> with explicitly **no beacon-node fetch and no slashing protection** (Lighthouse already
+> fetched the data and abstained on no-block at the 75 % cutoff). The HTTP timeout quotients
+> for PTC duties are wired in the client (`HTTP_PTC_DUTIES_TIMEOUT_QUOTIENT`,
+> `HTTP_PAYLOAD_ATTESTATION_TIMEOUT_QUOTIENT`, `client/src/lib.rs:80–81`). What remains open
+> is the client-side `PayloadAttestationService` that drives Lighthouse's PTC duty loop
+> against the Anchor backend (#1038). Because PTC is honest-convergence rather than
+> consensus, a minority operator near the observation cutoff can silently miss the threshold;
+> surfacing that as a distinguishable divergence metric (#1079) is **not** a normative spec
+> requirement and is open research.
 
-### 15.7 Proposer preferences (planned, not yet merged)
+> **Spec note — `payload_present` is not the whole story.** The Ethereum
+> `PayloadAttestationData` carries **two** booleans: `payload_present` *and*
+> `blob_data_available`. A PTC member attests to both — that the payload was revealed on
+> time *and* that its blob data is available — not just payload presence.
 
-Under ePBS a proposer broadcasts `SignedProposerPreferences` (fee recipient, target gas
-limit) so builders can construct payloads to its liking; *not* broadcasting them implicitly
-declines all external-builder bids for that slot. In Anchor this is a future
-**signature-only** duty (no QBFT — every operator already knows the bytes), modeled on
-`sign_validator_registration_data`. The open issues stress one DVT-specific constraint:
-like registration, it **must not touch slashing protection** (Lighthouse bypasses the
-slashing DB and doppelganger for it, so Anchor must match), and — as with registration —
-operators will need to agree on byte-identical contents despite signing independently.
-`Role::ProposerPreferences` (`[8,0,0,0]`) and `PartialSignatureKind::ProposerPreferences = 8`
-are the planned wire identifiers (after `PTCAttester = 7`).
+### 15.7 Proposer preferences (planned, not yet started)
+
+Under ePBS a proposer broadcasts `SignedProposerPreferences` — fee recipient and
+`target_gas_limit` — to the `proposer_preferences` gossip topic, so builders can construct
+payloads to its liking; *not* broadcasting them implicitly declines all external-builder
+bids for that slot. (Note: the per-slot builder commitment is a separate object,
+`ExecutionPayloadBid`; proposer preferences are the proposer's standing intent.) In Anchor
+this is a future **signature-only** duty (no QBFT — every operator already knows the bytes),
+modeled on `sign_validator_registration_data`. Like registration it is expected to **not
+touch slashing protection** (Lighthouse bypasses the slashing DB and doppelganger for
+registration, so Anchor would match) — though note the SSV spec is currently *silent* on
+slashing protection for preferences, so this is an inference from the registration analogy,
+not a stated requirement. As with registration, operators must agree on byte-identical
+contents despite signing independently.
+
+None of this exists in code yet: there is **no `Role::ProposerPreferences`** in `msgid.rs`,
+and `sign_proposer_preferences` (`validator_store/src/lib.rs:3367`) is an `Unsupported` /
+`TODO(gloas)` stub. The work is tracked across four issues: the role + message-validator
+fork-gate (#1062), the signing path (#1063), the client-side `ProposerPreferencesService`
+(#1064), and fork-gating the existing `RegistrationService` at the Gloas epoch (#1065).
 
 ### 15.8 Status summary
 
-| Area | State on `epbs` | Tracking |
-|---|---|---|
-| `Fork::CStar` variant, topic, schedule | **Merged** | #1016, #1030 |
-| Fork-aware attestation deadline (`get_attestation_due`) + `get_slot_duration` cleanup | **Merged** | #1024 |
-| `GloasBeaconVote` type + validator + QBFT routing | **Merged** | #1059, #1071, #1025 |
-| Gloas block decode (drop blinded path), sign + validate | **Merged** | #1070, #1072 |
-| `Role::PTCAttester` wire surface (validator-scoped, non-QBFT) | **Merged** | #1033→#1080, #1047↩#1076 |
-| Apply decided `attestation_data_index` to `AttestationData` | **Open (TODO in code)** | #1027 |
-| Migrate sync-committee committee vote to `GloasBeaconVote` | **Open (known per-slot timeout)** | #1061 |
-| `sign_block` Gloas destructure | **Open (blocked on LH)** | #1017 |
-| `sign_payload_attestation` + PTC client service | **Open (stubbed)** | #1077, #1078 |
-| Proposer preferences (role, sign path, service) | **Open (unstarted)** | #1062–#1065 |
-| Replace `Fork::CStar` gate with `gloas_enabled()` | **Open PR** | #1090 |
-| WAD timeout / eager-start under tighter budget | **Open research** | #1028, #1092 |
+State is as of `epbs` HEAD `a7c0b84`. **Merged** rows cite the **PR** that landed the work
+(verifiable in `git log unstable..epbs`); **Open** rows cite the **issue** tracking the gap.
 
-**Maintainer takeaway.** The merged work is the *plumbing*: a new fork, a wider attestation
-vote, fork-gated decoding, and a new role classification. The behavior is **not yet
-end-to-end** — the decided index isn't applied (#1027), the sync path times out (#1061),
-and the PTC/preferences duties are stubs. When reading this code, the `>= Fork::CStar`
-branches and the `TODO(cstar)` / `TODO(#…)` markers are your search anchors, and the
-single largest pending decision is whether the SSV fork gate survives at all (#1090).
+**Merged (on `epbs`):**
+
+| Area | PR(s) |
+|---|---|
+| Lighthouse bump to a Gloas-aware `unstable` | #1013 |
+| Fork-aware attestation deadline (`get_attestation_due`) + `get_slot_duration` cleanup | #1024 |
+| `GloasBeaconVote` consensus value | #1059 |
+| `GloasBeaconVoteValidator` (index range-check + cross-index slashability) | #1071 |
+| Gloas decode branch on `ProposerConsensusData` (`decode_block`) | #1070 |
+| Fork-gate block decode / validate, drop the blinded path | #1072 |
+| `Role::PTCAttester` wire surface (validator-scoped, non-QBFT) | #1033 (orig `PTCCommittee`) → #1080 (retarget) |
+| `PayloadAttestationVote` QBFT value object — **added then reverted** as dead code | #1047 ↩ #1076 |
+| `sign_payload_attestation` (SingleValidator partial-sig, no slashing protection) | #1082 |
+| **Remove `Fork::CStar`; gate ePBS on Ethereum `gloas_enabled()`** | #1090 |
+| (`Fork::CStar` + `cstar` schedule were added by #1016/#1030, then **deleted by #1090**) | #1016, #1030 → #1090 |
+
+**Open (gaps and follow-ups):**
+
+| Area | State | Issue(s) |
+|---|---|---|
+| Apply decided `attestation_data_index` onto each `AttestationData` before signing | `TODO(#1027)` in code | #1027 |
+| Migrate sync-committee committee vote to `GloasBeaconVote` | known per-slot timeout after Gloas | #1061 |
+| `sign_block` Gloas `FullBlockContents` destructure | blocked on Lighthouse beacon-APIs #580 | #1017 |
+| `produceBlockV4` / proposer block-decode spec tests | open | #1073 |
+| PTC client service (`PayloadAttestationService`) + metadata voting-context phase | open (signing path itself merged via #1082) | #1038, #1036 |
+| Proposer preferences: role, sign path, service, registration fork-gate | unstarted; no `Role::ProposerPreferences` yet | #1062, #1063, #1064, #1065 |
+| `sign_execution_payload_envelope` | `Unsupported` stub; spec (PR #94) now wants a QBFT duty | *(no issue; spec in flux)* |
+| WAD timeout under tighter budget / eager-start decoupling | open research | #1028, #1092 |
+| PTC no-threshold divergence metric | open research, non-normative | #1079 |
+| Wire PTC *committee-scoped* QBFT instances | **obsolete** — superseded by the validator-scoped redesign | #1035 |
+
+> **Stale-issue caveat.** Issue hygiene on the upstream tracker lags the code: #1037
+> ("implement `sign_payload_attestation`") and #1038 duplicate the now-closed #1077/#1078,
+> and #1035 belongs to the abandoned committee-scoped PTC design. Trust the **code** and the
+> merged-PR list over open-issue titles where they disagree.
+
+**Maintainer takeaway.** The merged work is the *plumbing*: Ethereum-fork gating (no SSV
+fork), a wider attestation vote, fork-gated block decoding, a new role classification, and
+the PTC signing path. The behavior is **not yet end-to-end** — the decided index isn't
+applied (#1027), the sync-committee path times out every slot after Gloas (#1061), block
+signing is blocked on Lighthouse (#1017), and proposer preferences are unstarted
+(#1062–#1065). When reading this code, **`gloas_enabled()` / `ForkName::Gloas`** branches and
+`TODO(gloas)` / `TODO(#…)` markers are your search anchors. Two specs are still moving — the
+Ethereum Gloas spec and SSV's unmerged SIP PR #94 — so re-check both before treating any
+"open question" here as settled.
 
 ---
 
@@ -1772,10 +1991,11 @@ A quick index of "symptom → where to look," distilled from the hot paths above
 
 Code excerpts and `file:line` anchors in §§1–14 and §16 were taken from the `unstable`
 branch by reading the sources directly; the **§15 ePBS / Gloas** anchors were taken from
-the `epbs` branch, which is ahead of `unstable` and still in active development. They are
-accurate as a *map*, but line numbers drift — treat the quoted **function and type names**
-as the durable references and re-locate by symbol when a line number no longer matches.
-The §15 "open" items reflect the issue/PR state at the time of writing and will go stale
-fastest; re-check the linked issues before relying on them. This document describes
+the `epbs` branch at HEAD `a7c0b84`, which is ahead of `unstable` and still in active
+development. They are accurate as a *map*, but line numbers drift — treat the quoted
+**function and type names** as the durable references and re-locate by symbol when a line
+number no longer matches. The §15 "open" items reflect the issue/PR state at the time of
+writing and will go stale fastest; re-check the linked issues — and both moving specs (the
+Ethereum Gloas spec and SSV's unmerged SIP PR #94) — before relying on them. This document describes
 structure and data flow; it does not replace running `make test` / `make lint` when you
 change any of these paths (see `.claude/rules/verification.md`).
