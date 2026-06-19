@@ -1,4 +1,7 @@
-# Anchor Internals: A Maintainer's Field Guide to SSV Validator Duties
+## Disclaimer: This is wholly AI-generated and a work in progress!
+**As I'm a relative newcomer to eth, I expect a lot of mis-specifications and general wrong info to surface as a result. If you spot any incorrect stuff, just add a comment, PR, or ping me on Mattermost and I'll fix it! I'll keep re-reviewing as my understanding improves and as a result the error rate should diminish.**
+
+# Anchor Internals: A Maintainer's Field Guide to Consensus Layer and SSV Validator Duties
 
 > **Audience.** This document is written for someone who is becoming a maintainer of
 > the Anchor codebase and who is *new* to Ethereum, the consensus layer, and SSV.
